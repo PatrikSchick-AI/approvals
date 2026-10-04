@@ -1,0 +1,27 @@
+# Approval requests. A request is an issue opened by the agent account; its title names what is to be
+# approved. The job waits for the environment's required reviewer. The approval itself is the record:
+# other repositories read it through the API. This repository holds no project code and no secrets.
+name: approve
+run-name: approve ${{ github.event.issue.title }}
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  approve:
+    name: approve
+    if: ${{ github.event.issue.user.login == 'agent-schick' }}
+    runs-on: ubuntu-latest
+    environment: approve
+    timeout-minutes: 5
+    steps:
+      - name: Close the request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: gh issue close "$ISSUE" --repo "$REPO" --comment "Approved in run ${GITHUB_RUN_ID}."
