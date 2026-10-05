@@ -1,6 +1,17 @@
-# Approval requests. A request is an issue opened by the agent account; its title names what is to be
-# approved. The job waits for the environment's required reviewer. The approval itself is the record:
-# other repositories read it through the API. This repository holds no project code and no secrets.
+# dev-gates approvals repository workflow. Not installed by install.py: copy it by hand to
+# .github/workflows/approve.yml of the public approvals repository and replace __GATES_REQUESTERS__
+# (a JSON array of the logins allowed to open requests) and __GATES_APPROVAL_LABEL__ (the approval label
+# of the private repository). README.md, section "Approvals repository".
+# A request is an issue titled with the binding string <owner/name>#<number>@<head sha>. Job `approve`
+# waits in the environment `approve` for its required reviewer; the approved review of that run is the
+# record that the guard of the private repository reads. Nothing from the event is interpolated into a
+# shell line: the issue title and author reach the scripts only through env variables.
+# After the approval the label is first removed from the pull request (404: it was not there; any other
+# failure fails the step) and then added, so that adding it is a real transition: a label that is already
+# there emits no new `labeled` event when it is added again. The label reaches the URL path
+# percent-encoded. The step talks only to https://api.github.com (GITHUB_API_URL is not read), follows no
+# redirect, ignores proxy settings of the environment and counts only a 2xx answer as success, so the
+# token goes only to that host. Not verified live yet.
 name: approve
 run-name: approve ${{ github.event.issue.title }}
 
@@ -8,20 +19,162 @@ on:
   issues:
     types: [opened]
 
-permissions:
-  issues: write
+permissions: {}
+
+env:
+  BINDING_PATTERN: '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)@([0-9a-f]{40})'
 
 jobs:
+  announce:
+    name: announce
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    outputs:
+      accepted: ${{ steps.check.outputs.accepted }}
+    steps:
+      - name: Check the requester and the title
+        id: check
+        env:
+          REQUESTERS: '["agent-schick"]'
+          AUTHOR: ${{ github.event.issue.user.login }}
+          TITLE: ${{ github.event.issue.title }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, re
+          try:
+              requesters = json.loads(os.environ["REQUESTERS"])
+          except ValueError:
+              requesters = []
+          if not isinstance(requesters, list):
+              requesters = []
+          allowed = {login.casefold() for login in requesters if isinstance(login, str)}
+          accepted = (os.environ["AUTHOR"].casefold() in allowed
+                      and re.fullmatch(os.environ["BINDING_PATTERN"], os.environ["TITLE"]) is not None)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"accepted={'true' if accepted else 'false'}\n")
+          print("accepted" if accepted else "ignored: requester or title not accepted")
+          PY
+
+      - name: Link the run
+        if: steps.check.outputs.accepted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: gh issue comment "$ISSUE" --body "Waiting for approval in $RUN_URL"
+
   approve:
     name: approve
-    if: ${{ github.event.issue.user.login == 'agent-schick' }}
+    needs: announce
+    if: needs.announce.outputs.accepted == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: approve
+    permissions:
+      issues: write
+    env:
+      HAS_TARGET_TOKEN: ${{ secrets.GATES_TARGET_TOKEN != '' }}
+    steps:
+      - name: Read the target from the title
+        id: target
+        env:
+          TITLE: ${{ github.event.issue.title }}
+        run: |
+          python3 -I - <<'PY'
+          import os, re
+          match = re.fullmatch(os.environ["BINDING_PATTERN"], os.environ["TITLE"])
+          if match is None:
+              raise SystemExit("the title is not a binding string")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"repository={match.group(1)}\nnumber={match.group(2)}\n")
+          PY
+
+      - name: Add the approval label to the pull request
+        if: env.HAS_TARGET_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GATES_TARGET_TOKEN }}
+          TARGET_REPOSITORY: ${{ steps.target.outputs.repository }}
+          TARGET_NUMBER: ${{ steps.target.outputs.number }}
+          LABEL: 'gates-change-approved'
+        run: |
+          python3 -I - <<'PY'
+          import json, os, urllib.error, urllib.parse, urllib.request
+          API = "https://api.github.com"  # constant: GITHUB_API_URL is not read
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None  # every 3xx becomes an HTTPError of the phase it happened in
+
+
+          # Only what HTTPS needs: no proxy from the environment, no redirects, no other schemes.
+          opener = urllib.request.OpenerDirector()
+          for handler in (urllib.request.ProxyHandler({}), NoRedirect(), urllib.request.HTTPSHandler(),
+                          urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor()):
+              opener.add_handler(handler)
+          issue = f"{API}/repos/{os.environ['TARGET_REPOSITORY']}/issues/{os.environ['TARGET_NUMBER']}"
+          label = os.environ["LABEL"]
+          headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json",
+                     "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "dev-gates-approve"}
+
+
+          def call(method, url, body=None):
+              data = None if body is None else json.dumps(body).encode("utf-8")
+              extra = {} if data is None else {"Content-Type": "application/json"}
+              request = urllib.request.Request(url, data=data, method=method, headers={**headers, **extra})
+              with opener.open(request, timeout=30) as response:
+                  if not 200 <= response.status < 300:
+                      raise SystemExit(f"{method} answered HTTP {response.status}")
+
+
+          # Remove first, so that adding is a real transition with a new `labeled` event; 404: it was not there.
+          try:
+              call("DELETE", f"{issue}/labels/{urllib.parse.quote(label, safe='')}")
+              print("removed the label")
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise SystemExit(f"removing the label failed: HTTP {exc.code}")
+              print("the label was not on the pull request")
+          except Exception as exc:
+              raise SystemExit(f"removing the label failed: {type(exc).__name__}")
+          try:
+              call("POST", f"{issue}/labels", {"labels": [label]})
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f"adding the label failed: HTTP {exc.code}")
+          except Exception as exc:
+              raise SystemExit(f"adding the label failed: {type(exc).__name__}")
+          print("added the label")
+          PY
+
+      - name: Close the request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          comment="Approved in run $RUN_ID."
+          if [ "$HAS_TARGET_TOKEN" != "true" ]; then
+            comment="$comment GATES_TARGET_TOKEN is not set, so no label was added: re-run the guard of the pull request by hand."
+          fi
+          gh issue close "$ISSUE" --comment "$comment"
+
+  rejected:
+    name: rejected
+    needs: approve
+    if: ${{ always() && needs.approve.result == 'failure' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      issues: write
     steps:
       - name: Close the request
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           ISSUE: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
-        run: gh issue close "$ISSUE" --repo "$REPO" --comment "Approved in run ${GITHUB_RUN_ID}."
+          RUN_ID: ${{ github.run_id }}
+        run: gh issue close "$ISSUE" --comment "Rejected or failed in run $RUN_ID."
